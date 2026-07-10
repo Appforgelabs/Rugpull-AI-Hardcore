@@ -1,0 +1,328 @@
+"""
+analyze.py — Hardcore orchestrator.
+
+Improvements:
+- Uses fundamentals.pe_distribution_from_prices (no more inline dupe)
+- Proper logging instead of silent excepts
+- Cleaner error surfaces
+- DCF assumptions can be overridden from UI / caller
+"""
+
+from __future__ import annotations
+import sys
+import json
+import logging
+
+import numpy as np
+
+from fmp_client import FMPClient, FMPError
+import fundamentals as F
+import technicals as T
+import signals as S
+import prediction_zones as PZ
+import trade_signals as TS
+import macro_engine as ME
+import volume_profile as VP
+from logging_config import log
+
+
+def _clean(o):
+    """Recursively cast numpy scalars to native types so results are JSON-safe."""
+    if isinstance(o, dict):
+        return {k: _clean(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_clean(v) for v in o]
+    if isinstance(o, (np.integer,)):
+        return int(o)
+    if isinstance(o, (np.floating,)):
+        return float(o)
+    if isinstance(o, np.bool_):
+        return bool(o)
+    return o
+
+
+# Edit these. They encode YOUR philosophy. Defaults lean fundamentals-first.
+WEIGHTS = {
+    "quality":   0.30,
+    "value":     0.25,
+    "momentum":  0.25,
+    "sentiment": 0.10,
+    "dcf":       0.10,
+}
+
+
+def build_trading(
+    client: FMPClient,
+    sym: str,
+    intraday_interval="5min",
+    spy_closes: list | None = None,
+    weights: dict | None = None,
+) -> dict:
+    """Trading-tab data for one ticker."""
+    import pandas as pd
+
+    hist = client.history(sym)
+    daily = TS.to_ohlcv(hist)
+
+    intraday_df = None
+    session_df = None
+    try:
+        bars = client.intraday(sym, interval=intraday_interval, days_back=7)
+        intraday_df = TS.to_ohlcv(bars)
+        if not intraday_df.empty:
+            last_day = intraday_df["date"].dt.date.max()
+            session_df = intraday_df[intraday_df["date"].dt.date == last_day]
+    except Exception as e:
+        log.warning("%s intraday failed: %s", sym, e)
+        intraday_df = None
+
+    row = TS.build_trading_row(daily, intraday_df, session_df, weights=weights)
+    row["symbol"] = sym.upper()
+    row["intraday_available"] = bool(intraday_df is not None and not intraday_df.empty)
+
+    # TD Sequential
+    try:
+        import demark as DM
+        row["demark"] = DM.td_state(daily)
+    except Exception as e:
+        log.debug("DeMark unavailable for %s: %s", sym, e)
+        row["demark"] = {"ok": False}
+
+    # volume-shelf
+    try:
+        vp = VP.build_profile(daily) if not daily.empty else {"ok": False}
+        if vp.get("ok"):
+            row["vp"] = {
+                "poc": vp["poc"],
+                "support": (vp.get("support_shelf") or {}).get("mid"),
+                "resistance": (vp.get("resistance_shelf") or {}).get("mid"),
+                "overhead_pct": vp["overhead_supply_pct"],
+            }
+    except Exception as e:
+        log.debug("Volume profile failed %s: %s", sym, e)
+
+    # relative strength vs SPY
+    if spy_closes and not daily.empty:
+        try:
+            row["rel_strength"] = ME.relative_strength(daily["close"].tolist(), spy_closes)
+        except Exception as e:
+            log.debug("RS failed %s: %s", sym, e)
+
+    return _clean(row)
+
+
+def analyze(
+    client: FMPClient,
+    sym: str,
+    sentiment_provider,
+    dcf_kwargs: dict | None = None,
+) -> dict:
+    """Full analysis. dcf_kwargs can override growth / discount etc."""
+    dcf_kwargs = dcf_kwargs or {}
+
+    profile = client.profile(sym)
+    quote   = client.quote(sym)
+    price   = float(quote.get("price") or profile.get("price") or 0) or None
+    shares  = float(profile.get("sharesOutstanding") or quote.get("sharesOutstanding") or 0) or None
+
+    income   = client.income(sym)
+    balance  = client.balance(sym)
+    cashflow = client.cashflow(sym)
+    rttm     = client.ratios_ttm(sym)
+    rhist    = client.ratios(sym)
+    hist     = client.history(sym)
+
+    df = T.to_frame(hist)
+
+    q = F.quality_score(income, balance, cashflow, rttm)
+    v = F.value_score(rhist, rttm)
+    dcf = F.simple_dcf(cashflow, shares, price, **dcf_kwargs) if (price and shares) else {
+        "intrinsic_value": None, "note": "no price/shares"}
+    mom = T.momentum_score(df) if not df.empty else {"score": 50.0}
+    sent = sentiment_provider.score(sym)
+
+    mos = dcf.get("margin_of_safety")
+    dcf_leg = 50.0 if mos is None else max(0, min(100, 50 + mos * 100))
+
+    legs = {
+        "quality":   q["score"],
+        "value":     v["score"],
+        "momentum":  mom["score"],
+        "sentiment": sent["score"],
+        "dcf":       round(dcf_leg, 1),
+    }
+    composite = round(sum(legs[k] * WEIGHTS[k] for k in WEIGHTS), 1)
+
+    levels = T.entry_exit_levels(df) if not df.empty else {}
+    forecast = T.naive_forecast(df) if not df.empty else {}
+
+    km = client.key_metrics(sym)
+    multiples = F.valuation_multiples(rttm, km)
+    pe_dist = F.pe_distribution(rhist)
+    pe_debug = f"ratios:n={pe_dist.get('n', 0)}"
+
+    # Single source of truth for PE fallback
+    if not pe_dist.get("median"):
+        try:
+            eh = client.earnings(sym)
+            pe_dist = F.pe_distribution_from_prices(hist, eh)
+            pe_debug += f" | fallback pe_n={pe_dist.get('n', 0)} source={pe_dist.get('source')}"
+        except Exception as e:
+            pe_debug += f" | fallback ERROR: {type(e).__name__}: {e}"
+            log.warning("PE fallback failed for %s: %s", sym, e)
+
+    closes = df["close"].tolist() if not df.empty else []
+
+    ntm_info = {"ntm_eps": None}
+    try:
+        ntm_info = F.ntm_eps_from_estimates(client.estimates(sym))
+    except Exception as e:
+        log.debug("Estimates failed %s: %s", sym, e)
+        ntm_info = {"ntm_eps": None, "note": "estimates unavailable"}
+
+    ntm_eps = ntm_info.get("ntm_eps")
+    eps_source = ntm_info.get("source", "none")
+    if not ntm_eps:
+        eps_ttm = None
+        if income and shares:
+            ni = income[0].get("netIncome")
+            if ni:
+                try:
+                    eps_ttm = float(ni) / shares
+                except (TypeError, ValueError):
+                    pass
+        ntm_eps = eps_ttm * 1.08 if eps_ttm else None
+        eps_source = "proxy_ttm_x1.08" if ntm_eps else "none"
+
+    zones = PZ.build_zones(
+        closes,
+        ntm_eps=ntm_eps,
+        pe_median=pe_dist.get("median"),
+        pe_sigma=pe_dist.get("sigma"),
+    )
+    corridor_debug = (
+        f"ntm_eps={round(ntm_eps, 2) if ntm_eps else None} ({eps_source}) · "
+        f"pe_median={pe_dist.get('median')} · {pe_debug} · "
+        f"corridor_ok={zones.get('corridor', {}).get('ok')}"
+    )
+    if zones.get("corridor", {}).get("ok"):
+        zones["corridor"]["eps_source"] = eps_source
+        zones["corridor"]["pe_source"] = pe_dist.get("source", "ratios")
+        zones["corridor"]["ntm_eps_low"] = ntm_info.get("ntm_eps_low")
+        zones["corridor"]["ntm_eps_high"] = ntm_info.get("ntm_eps_high")
+
+    vp = {"ok": False}
+    try:
+        vp = VP.build_profile(df) if not df.empty else {"ok": False}
+    except Exception as e:
+        log.debug("VP in analyze failed: %s", e)
+
+    series = []
+    if not df.empty:
+        d = df[["date", "close"]].tail(260)
+        series = [{"d": str(r.date.date()), "c": round(float(r.close), 2)}
+                  for r in d.itertuples()]
+
+    _result = {
+        "symbol": sym.upper(),
+        "company": profile.get("companyName", sym.upper()),
+        "price": price,
+        "composite_score": composite,
+        "legs": legs, "weights": WEIGHTS,
+        "quality": q, "value": v, "dcf": dcf,
+        "momentum": mom, "sentiment": sent,
+        "entry_exit": levels, "naive_forecast": forecast,
+        "multiples": multiples, "pe_distribution": pe_dist,
+        "zones": zones, "series": series,
+        "corridor_debug": corridor_debug,
+        "volume_profile": vp,
+    }
+    return _clean(_result)
+
+
+def _verdict(score: float) -> str:
+    if score >= 70: return "Strong profile — warrants a closer look"
+    if score >= 58: return "Constructive — conditions broadly favorable"
+    if score >= 45: return "Mixed — no clear edge"
+    if score >= 35: return "Weak — headwinds outweigh"
+    return "Poor — multiple red flags"
+
+
+def report(res: dict, macro: dict) -> str:
+    L = res["legs"]
+    out = []
+    out.append(f"\n{'='*64}")
+    out.append(f"  {res['symbol']}  —  {res['company']}")
+    out.append(f"  Price: {res['price']}   Composite: {res['composite_score']}/100")
+    out.append(f"  {_verdict(res['composite_score'])}")
+    out.append(f"{'='*64}")
+    out.append("  Component scores (each 0–100, with its weight):")
+    for k in res["weights"]:
+        out.append(f"    {k:<10} {L[k]:>6}   x{res['weights'][k]:.2f}")
+    out.append("")
+    q = res["quality"]
+    out.append(f"  Quality factors: {q.get('factors')}")
+    if q.get("rev_cagr") is not None:
+        out.append(f"    revenue CAGR: {q['rev_cagr']:.1%}")
+    v = res["value"]
+    out.append(f"  Valuation: P/E now {v.get('pe_now')} vs hist median "
+               f"{v.get('pe_median_hist')}  (discount {v.get('discount_vs_history')})")
+    d = res["dcf"]
+    if d.get("intrinsic_value") is not None:
+        out.append(f"  DCF intrinsic: {d['intrinsic_value']}  "
+                   f"margin of safety {d.get('margin_of_safety')}  "
+                   f"(assumes {d['assumptions']})")
+    m = res["momentum"]
+    out.append(f"  Momentum: {'>200dma ' if m.get('above_200dma') else '<200dma '}"
+               f"{'golden-cross' if m.get('golden_cross') else 'no golden-cross'}  "
+               f"3m {m.get('ret_3m')}")
+    s = res["sentiment"]
+    out.append(f"  Sentiment: {s['score']}/100 from {s['n']} items ({s['source']})")
+
+    ee = res["entry_exit"]
+    if ee:
+        tilt = macro.get("tilt", 1.0)
+        out.append(f"\n  Entry/exit (rule-based; macro tilt x{tilt} on strictness):")
+        out.append(f"    support {ee.get('support')} | resistance {ee.get('resistance')}")
+        out.append(f"    vwap band {ee.get('vwap_lower_band')}–{ee.get('vwap_upper_band')}")
+        out.append(f"    suggested stop (2*ATR): {ee.get('suggested_stop_2atr')}")
+    f = res["naive_forecast"]
+    if f.get("central_projection"):
+        out.append(f"  21d cone (humble): {f['ci95_low']} … {f['central_projection']} "
+                   f"… {f['ci95_high']}")
+        out.append(f"    └ {f['warning']}")
+    return "\n".join(out)
+
+
+def main(symbols):
+    try:
+        client = FMPClient()
+    except FMPError as e:
+        print(e)
+        sys.exit(1)
+
+    macro = S.macro_regime(client)
+    print(f"\nMacro regime: {macro.get('regime')}  (10y-2y spread "
+          f"{macro.get('spread_10y_2y')})  -> strictness tilt x{macro.get('tilt')}")
+
+    sp = S.FMPNewsSentiment(client)
+    results = []
+    for sym in symbols:
+        try:
+            res = analyze(client, sym, sp)
+            results.append(res)
+            print(report(res, macro))
+        except Exception as e:
+            log.exception("[%s] failed", sym)
+            print(f"\n[{sym}] failed: {e}")
+
+    results.sort(key=lambda r: r["composite_score"], reverse=True)
+    print(f"\n{'='*64}\n  RANKING\n{'='*64}")
+    for r in results:
+        print(f"  {r['composite_score']:>5}/100  {r['symbol']:<6} {r['company']}")
+    print()
+
+
+if __name__ == "__main__":
+    args = sys.argv[1:] or ["AAPL"]
+    main(args)
