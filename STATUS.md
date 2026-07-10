@@ -1,35 +1,68 @@
-# Rugpull AI Hardcore — Current Status
+# Rugpull AI Hardcore — Status (updated)
 
 **Repo**: https://github.com/Appforgelabs/Rugpull-AI-Hardcore
 
-## What's done (Hardcore improvements)
-- [x] New repo created under Appforgelabs
-- [x] Hardened `fmp_client.py` (premium throttle 0.12s, size-aware cache prune, better errors/logging, history TTL)
-- [x] Cleaned `fundamentals.py` (rev CAGR fixed, single PE-from-prices source of truth)
-- [x] Improved `analyze.py` (no silent excepts, uses F.pe_distribution_from_prices, logging)
-- [x] Hardened `signals.py`, `technicals.py`, `trade_signals.py` (v2 design preserved), `ta_engine.py`, `demark.py`
-- [x] Centralized `logging_config.py`
-- [x] Pinned `requirements.txt` + pytest + black + mypy
-- [x] `.gitignore`, `secrets.toml.example`
-- [x] Unit tests skeleton (`tests/`)
-- [x] Comprehensive README explaining philosophy + improvements
+## Done
+- Full core hardened (fmp_client premium, fundamentals, analyze, trade_signals, ta_engine, demark, signals, technicals, prediction_zones, volume_profile, macro_engine, snapshot_store, watchlist, cloud_sync)
+- Central logging
+- **New: error_log.py** — persistent JSONL error collector + in-memory ring buffer
+- Unit tests skeleton
+- Pinned requirements, .gitignore, secrets example
+- README updated
 
-## What's still needed for full Streamlit UI
-Copy (or I can push next) from original Rugpull_AI:
-- streamlit_app.py (large, works with Hardcore core after small import/logging tweaks)
-- snapshot_store.py, cloud_sync.py, watchlist.py
-- paper_portfolio.py, prediction_tracker.py, report_engine.py, research_screener.py
-- scenario_engine.py, macro_engine.py, dashboard.py, zone_chart.py, prediction_zones.py
-- volume_profile.py, backtest.py, learn_content.py, seasonality.py, quadrant_map.py
-- corridor.html, Code.gs
+## Remaining large modules (copy from original Rugpull_AI and drop in)
+These are still needed for the full multi-tab UI. They are compatible; just copy them and optionally add `from logging_config import log` + replace bare `except Exception:` with `log.warning(...)`.
 
-Just say **"finish full copy + light harden"** and I will push the remaining files with the silent-except → log.warning treatment applied where appropriate.
+```
+paper_portfolio.py
+prediction_tracker.py
+report_engine.py
+research_screener.py
+scenario_engine.py
+dashboard.py
+zone_chart.py
+backtest.py
+learn_content.py
+seasonality.py
+quadrant_map.py
+corridor.html
+Code.gs
+streamlit_app.py   <-- see below for how to add the Diagnostics tab
+```
 
-## How to use right now (CLI)
+## How to add the new Error Log / Diagnostics tab
+
+1. Copy the original `streamlit_app.py` into this repo.
+2. At the top add:
+   ```python
+   from error_log import get_error_log
+   from logging_config import log, setup_logging
+   setup_logging("INFO")
+   el = get_error_log()
+   ```
+3. Wrap risky calls (fetch_and_store, build_trading, etc.) with:
+   ```python
+   try:
+       ...
+   except Exception as e:
+       el.record("streamlit_app", e, context=f"ticker={sym}")
+       st.error(str(e))
+   ```
+4. Add "🔧 Diagnostics" to ALL_TABS and implement the tab body using the helper below (or import from diagnostics_tab.py if present).
+
+The Diagnostics tab shows:
+- Last 50 errors (newest first) with source, message, traceback snippet, timestamp
+- Summary counts by level / source
+- Clear button + Download JSON export
+- Quick tips for common FMP / cloud / snapshot issues
+
+This makes fixing production issues on Streamlit Cloud extremely fast — no more hunting Cloud logs.
+
+## Quick start (CLI works now)
 ```bash
 export FMP_API_KEY=your_premium_key
 pip install -r requirements.txt
-python analyze.py NVDA PLTR TSLA AMD
+python analyze.py NVDA PLTR TSLA
 ```
 
-Premium FMP is fully supported (higher limits, full history, lower throttle).
+Say “push remaining modules” if you want me to continue the full copy of the large files next turn.
